@@ -26,7 +26,7 @@ if __name__ == '__main__':
   controller.warp_to_encounter()
   controller.circularization_burn(periapsis=True)
   
-  controller.cancel_surface_velocity()
+  controller.cancel_surface_velocity(use_node=False)
   controller.prepare_for_landing()
   controller.suicide_burn()
   

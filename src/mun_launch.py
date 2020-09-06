@@ -13,7 +13,8 @@ if __name__ == '__main__':
   
   controller.wait_for_launch()
 
-  controller.setup_gravity_turn(1000, turn_start=50.0)
+  target_heading = controller.heading(conn.space_center.target_vessel.orbit)
+  controller.setup_gravity_turn(1000, turn_start=50.0, target_heading=target_heading)
     
   controller.launch(throttle=0.5, activate_stage=False)
   controller.to_altitude(conn.space_center.target_vessel.orbit.apoapsis_altitude)

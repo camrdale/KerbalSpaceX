@@ -152,6 +152,23 @@ class Controller:
       return first_ut
     return first_ut + period * math.ceil((now - first_ut) / period)
   
+  def heading(self, target_orbit):
+    # Heading to take off at to reach the target inclination.
+    body = self.vessel.orbit.body
+    longitude_ref_direction = body.longitude_at_position(target_orbit.reference_plane_direction(body.reference_frame), body.reference_frame)
+    longitude_of_ascending_node = target_orbit.longitude_of_ascending_node * 180 / math.pi 
+    vessel_longitude = body.longitude_at_position(self.vessel.position(body.reference_frame), body.reference_frame)
+
+    longitude_of_target_an = (longitude_ref_direction + longitude_of_ascending_node) % 360.0
+    longitude_diff = longitude_of_target_an - vessel_longitude
+    
+    if abs(longitude_diff) > 90.0:
+      # DN, so add inclination to the East heading
+      return 90.0 + target_orbit.inclination * 180.0 / math.pi
+    else:
+      # AN, so subtract the inclination from East (and normalize)
+      return (90.0 - target_orbit.inclination * 180.0 / math.pi) % 360.0
+    
   def target_rendezvous_time(self, target_orbit, transfer_start_time):
     # Calculate the time when the target reaches the rendezvous for a transfer.
     vessel_angle = (
@@ -208,7 +225,7 @@ class Controller:
     lrb_event.start()
     
   def activate_second_stage(self):
-    if self.vessel.control.current_stage > self.second_stage:
+    if self.second_stage is not None and self.vessel.control.current_stage > self.second_stage:
       # Decouple the first stage
       self.vessel.control.activate_next_stage()
       self.message('First Stage separated')
@@ -233,7 +250,7 @@ class Controller:
     self.second_stage_event.add_callback(self.activate_second_stage)
     self.second_stage_event.start()
   
-  def setup_gravity_turn(self, turn_end_altitude, turn_start=250.0):  
+  def setup_gravity_turn(self, turn_end_altitude, turn_start=250.0, target_heading=90.0):  
   
     # Set up streams for telemetry
     altitude_stream = self.conn.add_stream(getattr, self.vessel.flight(), 'mean_altitude')
@@ -251,7 +268,7 @@ class Controller:
         new_turn_angle = frac * 89
         if abs(new_turn_angle - self.turn_angle) > 0.5:
           self.turn_angle = new_turn_angle
-          self.vessel.auto_pilot.target_pitch_and_heading(90 - self.turn_angle, 90)
+          self.vessel.auto_pilot.target_pitch_and_heading(90 - self.turn_angle, target_heading)
           
       if altitude >= starting_altitude + turn_end_altitude:
         altitude_stream.remove_callback(apply_turn)
@@ -263,13 +280,15 @@ class Controller:
   # Methods that are used by other methods.
   ############################################################################################    
 
-  def auto_pilot_wait(self):
+  def auto_pilot_wait(self, target_vessel=None):
+    if target_vessel is None:
+      target_vessel = self.vessel
     time.sleep(0.1)
-    self.vessel.auto_pilot.wait()
-    while abs(self.vessel.auto_pilot.error) > 10.0:
-      print('Auto pilot wait terminated prematurely with error still: %0.3f' % (self.vessel.auto_pilot.error,))
+    target_vessel.auto_pilot.wait()
+    while abs(target_vessel.auto_pilot.error) > 10.0:
+      print('Auto pilot wait terminated prematurely with error still: %0.3f' % (target_vessel.auto_pilot.error,))
       time.sleep(1)
-      self.vessel.auto_pilot.wait()
+      target_vessel.auto_pilot.wait()
 
   def perform_burn(self, burn_ut, distance_to_target=None, **kwargs):
     # Set up streams for telemetry
@@ -362,7 +381,7 @@ class Controller:
   # Methods that launch a vessel into space.
   ############################################################################################    
   
-  def wait_for_launch(self):
+  def wait_for_launch(self, target_angle=None):
     # Set up streams for telemetry
     ut = self.conn.add_stream(getattr, self.conn.space_center, 'ut')
     
@@ -372,7 +391,8 @@ class Controller:
 
     frame = target.orbit.body.reference_frame
 
-    target_angle = -20.0 * math.pi / 180
+    if target_angle is None:
+      target_angle = -20.0 * math.pi / 180
     starting_ut = ut()
     
     def transfer_angle(transfer_time):
@@ -390,13 +410,19 @@ class Controller:
       if current_angle < -math.pi:
         current_angle += 2 * math.pi
       print('  Target %0.3f Time %0.1f Current %0.3f' % (target_angle, transfer_time - ut(), current_angle))
-      return target_angle - current_angle
+      return abs(target_angle - current_angle)
 
     # Look for a time when the transfer angle is met
     transfer_time = optimize.newton(
-      transfer_angle,
-      starting_ut + target.orbit.period / 2.0, tol=0.0001, maxiter=100,
+      transfer_angle, starting_ut + target.orbit.period / 2.0, tol=0.0001, maxiter=100,
       x1=(starting_ut + target.orbit.period))
+    
+    if transfer_time - starting_ut > target.orbit.period * 1.1:
+      print('  Launch window retry, %0.1f greater than period of %0.1f' % 
+            (transfer_time - starting_ut, target.orbit.period))
+      transfer_time = optimize.newton(
+        transfer_angle, starting_ut, tol=0.0001, maxiter=100,
+        x1=(transfer_time - target.orbit.period))
       
     self.message('Found launch window in %d seconds' % ((transfer_time - ut()),))
     
@@ -724,8 +750,8 @@ class Controller:
       self.vessel.auto_pilot.target_direction = tuple(-x for x in unit_vector(velocity()))
       self.auto_pilot_wait()
   
-      # Cancel the approach with at least 10 seconds to spare (plus any burn time)
-      approach_buffer = abs(delta_v) * (10.0 + self.burn_time(abs(delta_v)))
+      # Cancel the approach at 15m with at least 2 seconds to spare (plus any burn time)
+      approach_buffer = 15.0 + abs(delta_v) * (2.0 + self.burn_time(abs(delta_v)))
 
       distance = distance_to_target()
       last_distance = distance + 1.0
@@ -849,6 +875,7 @@ class Controller:
     ref_frame = self.conn.space_center.ReferenceFrame.create_hybrid(
         position=body.reference_frame,
         rotation=self.vessel.surface_reference_frame)
+    position = self.conn.add_stream(self.vessel.position, ref_frame)
     velocity = self.conn.add_stream(self.vessel.velocity, ref_frame)
     vertical_speed = self.conn.add_stream(getattr, self.vessel.flight(body.reference_frame), 'vertical_speed')
     surface_altitude = self.conn.add_stream(getattr, self.vessel.flight(body.reference_frame), 'surface_altitude')
@@ -871,11 +898,100 @@ class Controller:
     self.message('Hovering to the surface')
     self.vessel.control.throttle = self.hover_throttle() * 0.95
     while self.vessel.situation != self.conn.space_center.VesselSituation.landed:
-      self.vessel.auto_pilot.target_direction = tuple(-x for x in unit_vector(velocity()))
+      self.vessel.auto_pilot.target_direction = tuple(x for x in unit_vector(position()))
     self.vessel.control.throttle = 0.0
 
     self.vessel.auto_pilot.disengage()
     self.message('Welcome to ' + body.name + '!')
+
+  ############################################################################################    
+  # Methods for interacting with nearby ships.
+  ############################################################################################    
+
+  def cancel_relative_velocity(self):
+    target_port = self.conn.space_center.target_docking_port
+    target = target_port.part.vessel
+    self.vessel.control.rcs = False
+
+    velocity = self.conn.add_stream(self.vessel.velocity, target.orbital_reference_frame)
+    
+    if numpy.linalg.norm(numpy.array(velocity())) < 0.2:
+      return
+    
+    self.message('Canceling relative velocity')
+    delta_v = -numpy.linalg.norm(numpy.array(velocity()))
+    burn_time = self.burn_time(abs(delta_v))
+    full_throttle = 1.0
+    while burn_time < 2.0 and full_throttle > 0.001:
+      burn_time *= 10.0
+      full_throttle /= 10.0
+  
+    # Point in the opposite direction of the velocity
+    self.vessel.auto_pilot.target_direction = tuple(-x for x in unit_vector(velocity()))
+    self.vessel.auto_pilot.engage()
+    self.auto_pilot_wait()
+
+    self.vessel.control.throttle = full_throttle
+    time.sleep(burn_time)
+    self.vessel.control.throttle = 0.0
+    
+  def dock(self):
+    current_port = self.conn.space_center.active_vessel.parts.controlling.docking_port
+    target_port = self.conn.space_center.target_docking_port
+    target = target_port.part.vessel
+    self.vessel.control.rcs = False
+    self.vessel.control.sas = False
+    target.control.rcs = False
+    target.control.sas = False
+
+    vessel_position = self.conn.add_stream(self.vessel.position, target.orbital_reference_frame)
+    target_position = self.conn.add_stream(target.position, self.vessel.orbital_reference_frame)
+    distance = self.conn.add_stream(target_port.position, current_port.reference_frame)
+    velocity = self.conn.add_stream(current_port.part.velocity, target_port.reference_frame)
+
+    self.message('Orienting target ship for docking maneuver')
+    self.conn.space_center.active_vessel = target
+    target.control.throttle = 0.0
+    target.auto_pilot.reference_frame = target.orbital_reference_frame
+    target.auto_pilot.target_direction = unit_vector(vessel_position())
+    target.auto_pilot.engage()
+    self.auto_pilot_wait(target_vessel=target)
+    
+    self.message('Orienting vessel for docking maneuver')
+    self.conn.space_center.active_vessel = self.vessel
+    self.vessel.auto_pilot.reference_frame = self.vessel.orbital_reference_frame
+    self.vessel.auto_pilot.target_direction = unit_vector(target_position())
+    self.vessel.auto_pilot.engage()
+    self.auto_pilot_wait()
+    
+    self.message('Beginning docking approach')
+    self.vessel.control.rcs = True
+    while current_port.state == self.conn.space_center.DockingPortState.ready:
+      target.auto_pilot.target_direction = unit_vector(vessel_position())
+      self.vessel.auto_pilot.target_direction = unit_vector(target_position())
+      
+      current_distance = numpy.linalg.norm(numpy.array(distance()))
+
+      if -(velocity()[1]) < current_distance / 10.0:
+        self.vessel.control.forward = 0.5
+      elif -(velocity()[1]) > 1.5 * current_distance / 10.0:
+        self.vessel.control.forward = -0.5
+      else:
+        self.vessel.control.forward = 0.0
+      
+    self.message('Docking magnets engaged')
+
+    target.auto_pilot.disengage()
+    self.vessel.auto_pilot.disengage()
+    self.vessel.control.rcs = False
+
+    while current_port.state == self.conn.space_center.DockingPortState.docking:
+      pass
+    
+    if current_port.state == self.conn.space_center.DockingPortState.docked:
+      self.message('Docking complete')
+    else:
+      self.message('Docking failed!!!')
 
   ############################################################################################    
   # Methods that return a vessel to Kerbin.
